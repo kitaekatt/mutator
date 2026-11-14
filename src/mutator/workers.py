@@ -191,11 +191,15 @@ def _keep_dir(name: str) -> bool:
     return name not in SKIP_LINK and name != "node_modules"
 
 
-def _source_files(root: Path):
+def _source_files(root: Path, extensions=_EXTENSIONS):
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [name for name in dirnames if _keep_dir(name)]
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if _keep_dir(name) and not (Path(dirpath) / name / "pyvenv.cfg").exists()
+        ]
         for name in filenames:
-            if Path(name).suffix in _EXTENSIONS:
+            if Path(name).suffix in extensions:
                 yield Path(dirpath) / name
 
 
@@ -222,6 +226,27 @@ def importers_of(root: Path, relative: str) -> set[str]:
             pending.append(importer)
     root_resolved = root.resolve()
     return {path.relative_to(root_resolved).as_posix() for path in found}
+
+
+def own_path_readers(root: Path, relative: str) -> set[str]:
+    """Python files that read ``__file__``, when ``relative`` is Python.
+
+    ``Path(__file__).resolve()`` follows a link out of the worker, so a test
+    that finds the source tree that way would import the original. Such files
+    have to be real files in the worker.
+    """
+
+    if not relative.endswith(".py"):
+        return set()
+    found = set()
+    for source in _source_files(root, (".py",)):
+        try:
+            text = source.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+        if "__file__" in text:
+            found.add(source.relative_to(root).as_posix())
+    return found
 
 
 def _expand_directory(link: Path, real_dir: Path) -> None:
@@ -272,7 +297,7 @@ def create_workers(
 ) -> list[Path]:
     created = []
     first = relative.split("/", 1)[0]
-    importers = importers_of(root, relative)
+    importers = importers_of(root, relative) | own_path_readers(root, relative)
     for index in range(count):
         worker = base / f"worker-{index}"
         worker.mkdir(parents=True, exist_ok=True)

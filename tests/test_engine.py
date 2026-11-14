@@ -1,12 +1,13 @@
 import os
 import shutil
 import subprocess
+import sys
 import threading
 
 from mutator.engine import mutate_file, restore_backups
 from mutator.edn import loads
 from mutator.metrics import snapshot_path
-from mutator.runner import CommandResult
+from mutator.runner import CommandResult, CommandRunner
 from mutator.workers import create_workers, delete_tree, new_run_dir, worker_count
 
 
@@ -300,3 +301,73 @@ def test_restore_backups_puts_an_interrupted_mutant_back(tmp_path):
     assert restored == [source]
     assert source.read_text(encoding="utf-8") == "original\n"
     assert not backup.exists()
+
+
+def test_tests_that_find_the_source_by_their_own_path_hit_the_mutant(tmp_path):
+    # A conftest that locates the source with ``Path(__file__).resolve()`` must
+    # land in the worker. When the tests are a link into the real tree, resolve()
+    # leaves the worker and the tests import the original source.
+    source = tmp_path / "src" / "demo.py"
+    source.parent.mkdir()
+    source.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "conftest.py").write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        "ROOT = Path(__file__).resolve().parents[1]\n"
+        "sys.path.insert(0, str(ROOT / 'src'))\n",
+        encoding="utf-8",
+    )
+    (tests / "test_demo.py").write_text(
+        "import demo\n\n\ndef test_add():\n    assert demo.add(1, 2) == 3\n",
+        encoding="utf-8",
+    )
+    original = source.read_text(encoding="utf-8")
+
+    result = mutate_file(
+        source,
+        tmp_path,
+        runner=CommandRunner(),
+        covered_lines=None,
+        ignore_coverage=True,
+        mutate_all=True,
+        lines=None,
+        test_command=f"{sys.executable} -B -m pytest -q -p no:cacheprovider tests",
+        timeout_factor=10,
+        mutation_warning=50,
+        baselines={},
+        max_workers=1,
+    )
+
+    assert result.baseline_failed is False
+    assert sorted(result.statuses.values()) == ["killed"]
+    assert source.read_text(encoding="utf-8") == original
+
+
+def test_python_files_that_read_their_own_path_are_real_files_in_the_worker(tmp_path):
+    source = tmp_path / "src" / "demo.py"
+    source.parent.mkdir()
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    (tmp_path / "tests" / "deep").mkdir(parents=True)
+    reader = tmp_path / "tests" / "deep" / "conftest.py"
+    reader.write_text("from pathlib import Path\nHERE = Path(__file__).resolve()\n", encoding="utf-8")
+    (tmp_path / "tests" / "deep" / "test_demo.py").write_text("def test_it():\n    pass\n", encoding="utf-8")
+    venv = tmp_path / "env" / "lib"
+    venv.mkdir(parents=True)
+    (tmp_path / "env" / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+    (venv / "pkg.py").write_text("PATH = __file__\n", encoding="utf-8")
+
+    base = new_run_dir(tmp_path)
+    try:
+        worker = create_workers(base, tmp_path, "src/demo.py", source.read_bytes(), 1)[0]
+        copied = worker / "tests" / "deep" / "conftest.py"
+        assert copied.is_file() and not copied.is_symlink()
+        assert copied.resolve().is_relative_to(worker.resolve())
+        assert (worker / "tests" / "deep" / "test_demo.py").is_symlink()
+        assert (worker / "env").is_symlink()
+    finally:
+        delete_tree(base)
+
+    assert reader.read_text(encoding="utf-8").startswith("from pathlib")
+    assert (venv / "pkg.py").read_text(encoding="utf-8") == "PATH = __file__\n"
